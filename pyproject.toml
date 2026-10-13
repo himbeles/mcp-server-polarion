@@ -25,6 +25,9 @@ dependencies = [
     "markdown-it-py>=4.0.0",
 ]
 
+[project.optional-dependencies]
+sso = ["playwright>=1.50,<2"]
+
 [project.urls]
 Repository = "https://github.com/devemberx/mcp-server-polarion"
 Issues = "https://github.com/devemberx/mcp-server-polarion/issues"
@@ -41,6 +44,7 @@ dev = [
     "respx>=0.22",
     "ruff>=0.15",
     "mypy>=2.0",
+    "playwright>=1.50,<2",
 ]
 evals = [
     "strands-agents[litellm]",

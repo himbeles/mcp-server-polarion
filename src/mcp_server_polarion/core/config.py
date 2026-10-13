@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Final
+from pathlib import Path
+from typing import Final, Literal, Self
+from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEFAULT_MAX_REQUESTS_PER_SECOND: Final[float] = 1.0
@@ -31,8 +33,41 @@ class PolarionConfig(BaseSettings):
         ),
     )
     polarion_token: str = Field(
+        default="",
+        repr=False,
         description="Personal access token for Polarion REST API.",
     )
+    polarion_auth_mode: Literal["pat", "sso"] = "pat"
+    polarion_sso_url: str = ""
+    polarion_sso_headless: bool = True
+    polarion_sso_browser_channel: Literal["msedge", "chrome", "chromium"] = "msedge"
+    polarion_sso_browser_executable: Path | None = None
+    polarion_sso_profile_dir: Path = Field(
+        default_factory=lambda: Path.home() / ".mcp-server-polarion" / "browser-profile"
+    )
+    polarion_sso_timeout: float = Field(default=120, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _validate_auth(self) -> Self:
+        if self.polarion_auth_mode == "pat" and not self.polarion_token.strip():
+            raise ValueError("POLARION_TOKEN is required in PAT mode")
+        if self.polarion_auth_mode == "sso":
+            root = urlsplit(self.polarion_url)
+            sso = urlsplit(self.sso_login_url)
+            if root.scheme != "https" or root.username or root.password:
+                raise ValueError(
+                    "SSO requires an HTTPS Polarion URL without credentials"
+                )
+            if (sso.scheme, sso.netloc) != (root.scheme, root.netloc):
+                raise ValueError("POLARION_SSO_URL must use the Polarion origin")
+        return self
+
+    @property
+    def sso_login_url(self) -> str:
+        return self.polarion_sso_url or (
+            f"{self.polarion_url.rstrip('/')}/polarion/ssoLogin/Single-Sign-On"
+        )
+
     polarion_verify_ssl: bool = Field(
         default=True,
         description=(

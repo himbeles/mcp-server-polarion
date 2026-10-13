@@ -302,3 +302,68 @@ Bug reports and pull requests are welcome — see [CONTRIBUTING.md](.github/CONT
 ## License
 
 [MIT](LICENSE)
+
+## Browser SSO authentication (optional)
+
+Use this mode when API access is available through a logged-in Polarion session
+using `X-Polarion-REST-Token`. Install the browser integration:
+
+```sh
+uv pip install 'mcp-server-polarion[sso]'
+```
+
+For a source checkout, use `uv sync --dev --extra sso`. No PAT is required in SSO
+mode. Configure your server with your instance root (without `/polarion`):
+
+```json
+{
+  "servers": {
+    "polarion": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/checkout", "--extra", "sso", "mcp-server-polarion"],
+      "env": {
+        "POLARION_URL": "https://polarion.example.com",
+        "POLARION_AUTH_MODE": "sso",
+        "POLARION_SSO_BROWSER_CHANNEL": "msedge",
+        "POLARION_SSO_HEADLESS": "true"
+      }
+    }
+  }
+}
+```
+
+The default login URL is `${POLARION_URL}/polarion/ssoLogin/Single-Sign-On`.
+Override `POLARION_SSO_URL` for a different entry point on the same origin.
+Identity-provider redirects are handled by the browser. The landing page must
+expose `getRestApiToken()`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `POLARION_AUTH_MODE` | `pat` | Select `pat` or `sso` |
+| `POLARION_SSO_URL` | Derived from instance root | Direct SSO entry URL |
+| `POLARION_SSO_HEADLESS` | `true` | Hidden browser; use `false` for interactive login/MFA |
+| `POLARION_SSO_BROWSER_CHANNEL` | `msedge` | Installed Edge, `chrome`, or Playwright `chromium` |
+| `POLARION_SSO_BROWSER_EXECUTABLE` | Unset | Existing Chromium executable; overrides channel |
+| `POLARION_SSO_PROFILE_DIR` | `~/.mcp-server-polarion/browser-profile` | Dedicated persistent login profile |
+| `POLARION_SSO_TIMEOUT` | `120` | Login timeout in seconds |
+
+Installed Edge/Chrome need no browser download. For Playwright Chromium, install
+its browser separately (`python -m playwright install chromium`). Headless Shell
+cannot show MFA prompts. Corporate browser policy may prevent automated login;
+use visible mode when interaction is required, then reuse the profile in hidden
+mode. Do not run two MCP processes using the same profile simultaneously.
+
+The browser stays alive for the MCP process lifetime. Tokens and matching API
+cookies (including HttpOnly cookies) are refreshed before requests and never
+written to a credential export file. Treat the persistent browser profile as
+credential storage and keep it private; do not commit it. Authentication is
+repeated on HTTP 401 or an API redirect, with at most one authentication retry
+per operation. Redirects are not followed by the HTTP client. HTTP 403 remains a
+permission error and does not trigger reauthentication. Rejected requests,
+including uploads and streamed downloads, use the renewed session. API item
+permissions still apply. Non-JSON success responses are reported explicitly.
+
+Keep TLS verification enabled. HTTPX honors `SSL_CERT_FILE` for a corporate CA
+bundle; Edge/Chrome use their browser certificate trust. No URLs, cookies,
+passwords, or tokens should be included in issues or committed configurations.

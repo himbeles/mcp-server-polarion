@@ -24,6 +24,7 @@ from mcp_server_polarion.core.exceptions import (
     PolarionNotFoundError,
     PolarionResponseTooLargeError,
 )
+from mcp_server_polarion.core.sso import PolarionSsoSession
 
 logger: Final = logging.getLogger("mcp_server_polarion.core.client")
 
@@ -97,13 +98,15 @@ class PolarionClient:
         )
         # -inf: first request never wait, any clock epoch.
         self._last_request_monotonic: float = float("-inf")
+        self._sso = (
+            PolarionSsoSession(config) if config.polarion_auth_mode == "sso" else None
+        )
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._sso is None:
+            headers["Authorization"] = f"Bearer {config.polarion_token}"
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
-            headers={
-                "Authorization": f"Bearer {config.polarion_token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
+            headers=headers,
             timeout=httpx.Timeout(_DEFAULT_TIMEOUT_SECONDS),
             verify=config.polarion_verify_ssl,
         )
@@ -140,7 +143,23 @@ class PolarionClient:
 
     async def close(self) -> None:
         """Close underlying ``httpx.AsyncClient``."""
-        await self._client.aclose()
+        try:
+            await self._client.aclose()
+        finally:
+            if self._sso is not None:
+                await self._sso.close()
+
+    async def _auth_headers(
+        self, path: str, *, refresh: bool = False
+    ) -> dict[str, str]:
+        if self._sso is None:
+            return {}
+        if "://" in path or path.startswith("//") or "\\" in path:
+            raise PolarionAuthError(
+                "SSO requests require a relative API path", status_code=0
+            )
+        url = f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
+        return await self._sso.headers(url, refresh=refresh)
 
     async def get(
         self,
@@ -246,8 +265,10 @@ class PolarionClient:
                 "Content-Type": f"multipart/form-data; boundary={boundary}",
             }
 
+        auth_retried = False
         for attempt in range(_MAX_RETRIES + 1):
             # Pace every attempt: fixed backoff alone undershoot cap below 1 req/s.
+            auth_headers = await self._auth_headers(path)
             await self._pace()
             # Stamp per attempt — next request pace from last sent, not stale first.
             self._last_request_monotonic = loop.time()
@@ -259,7 +280,7 @@ class PolarionClient:
                     json=json,
                     data=data,
                     files=files,
-                    headers=multipart_headers,
+                    headers={**auth_headers, **(multipart_headers or {})},
                 )
             except httpx.HTTPError as exc:
                 raise PolarionError(
@@ -267,10 +288,41 @@ class PolarionClient:
                     status_code=0,
                 ) from exc
 
+            if (
+                self._sso is not None
+                and not auth_retried
+                and (response.status_code == _HTTP_UNAUTHORIZED or response.is_redirect)
+            ):
+                auth_retried = True
+                auth_headers = await self._auth_headers(path, refresh=True)
+                await self._pace()
+                self._last_request_monotonic = loop.time()
+                try:
+                    response = await self._client.request(
+                        method,
+                        path,
+                        params=params,
+                        json=json,
+                        data=data,
+                        files=files,
+                        headers={**auth_headers, **(multipart_headers or {})},
+                    )
+                except httpx.HTTPError:
+                    raise PolarionError(
+                        "HTTP transport failed after SSO renewal", status_code=0
+                    ) from None
+
             if response.is_success:
                 if response.status_code == _HTTP_NO_CONTENT or not response.content:
                     return {}
-                body: object = response.json()
+                try:
+                    body: object = response.json()
+                except ValueError:
+                    raise PolarionError(
+                        "Expected JSON from Polarion API; received non-JSON response. "
+                        "Check API URL and SSO routing.",
+                        status_code=response.status_code,
+                    ) from None
                 if not isinstance(body, dict):
                     return {"data": body}
                 return body
@@ -303,7 +355,9 @@ class PolarionClient:
             status_code=0,
         )
 
-    async def _request_bytes(self, path: str, *, max_bytes: int) -> bytes:
+    async def _request_bytes(
+        self, path: str, *, max_bytes: int, auth_retry: bool = True
+    ) -> bytes:
         """Stream GET behind :meth:`get_bytes`; retry 429/5xx like
         :meth:`_request`.
         """
@@ -312,14 +366,16 @@ class PolarionClient:
         backoff = _INITIAL_BACKOFF_SECONDS
         loop = asyncio.get_running_loop()
 
+        auth_retried = not auth_retry
         for attempt in range(_MAX_RETRIES + 1):
+            auth_headers = await self._auth_headers(path)
             await self._pace()
             self._last_request_monotonic = loop.time()
             try:
                 async with self._client.stream(
                     "GET",
                     path,
-                    headers={"Accept": _BYTES_ACCEPT_HEADER},
+                    headers={**auth_headers, "Accept": _BYTES_ACCEPT_HEADER},
                 ) as response:
                     if not response.is_success:
                         # Error body needed for _map_status_to_error below.
@@ -343,6 +399,18 @@ class PolarionClient:
                     f"HTTP transport error: {exc}",
                     status_code=0,
                 ) from exc
+
+            if (
+                self._sso is not None
+                and not auth_retried
+                and (response.status_code == _HTTP_UNAUTHORIZED or response.is_redirect)
+            ):
+                auth_retried = True
+                await self._auth_headers(path, refresh=True)
+                # One bounded recursive retry, with renewal disabled on that call.
+                return await self._request_bytes(
+                    path, max_bytes=max_bytes, auth_retry=False
+                )
 
             error = self._map_status_to_error(response)
 
